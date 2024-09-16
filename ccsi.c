@@ -15,8 +15,16 @@
   ((byte) & 0x01 ? '1' : '0') 
 
 
+
+//SRAM
 const char frame_sample_a_in[] = {0xAA, 0x30, 0x7F, 0xFF, 0x7F, 0xFF, 0x7F, 0xFF};
 const char frame_sample_a_out[] = {0xAA, 0x30, 0xBF, 0xFF, 0xDF, 0xFF, 0xEF, 0xFF, 0xFF, 0xFF};
+
+//something i made up
+const char frame_sample_b_in[] = {0xAA, 0x10, 0xAA, 0x10};
+const char frame_sample_b_out[] = {0xAA, 0x30, 0xD5, 0x08, 0x7F};
+
+
 
 /// @brief calculate the number of bytes for output buffer from input len.  There could be extra bits for stop beyond 18.
 /// @param len 
@@ -47,9 +55,10 @@ size_t output_len_calc(size_t len){
 /// @param out output buffer pre-allocated at length
 /// @param len_out length of allocated buffer
 /// @return error
-int8_t ccsi_packet_gen(char *in, size_t len_in, char *out, size_t len_out){
+int8_t ccsi_packet_gen(uint8_t *in, size_t len_in, uint8_t *out, size_t len_out){
     uint8_t shift = 0;
-    uint8_t mask_h = 0xFF;
+    uint8_t mask_h1 = 0xFF;
+    uint8_t mask_h2 = 0x00;
     uint8_t mask_l1 = 0xFF;
     uint8_t mask_l2 = 0x00;
     uint8_t mask_valid = 0x80;
@@ -57,12 +66,20 @@ int8_t ccsi_packet_gen(char *in, size_t len_in, char *out, size_t len_out){
     // uint8_t out[len_out];
     size_t j = 0;
 
+    memset(out, 0U, len_out);
+
     for(int i = 0; i < len_in; i=i+2){
-        out[j] |= in[i] >> shift & mask_h;
-        out[j+1] = (in[i+1] >> shift) & mask_l1;
-        out[j+2] = mask_valid | ((in[i+1] << shift ) & mask_l2);
+        printf("%d in-%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X - shift =%d\n", j, i, BYTE_TO_BINARY(out[j]), out[j], shift); 
+
+        out[j] |= (in[i] >> shift) & mask_h1;
+        printf("%d in-%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X - shift =%d\n", j, i, BYTE_TO_BINARY(out[j]), out[j], shift); 
+        out[j+1] = (in[i+1] >> shift) & mask_l1 | (in[i] << 8-shift);
+        printf("%d in-%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X - shift =%d, mask=%02X\n", j+1, i, BYTE_TO_BINARY(out[j+1]), out[j+1], shift, mask_valid); 
+        out[j+2] = mask_valid | (in[i+1] << 8-shift );
+        printf("%d in-%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X - shift =%d, mask=%02X\n", j+2, i, BYTE_TO_BINARY(out[j+2]), out[j+2], shift, mask_valid); 
         j=j+2;
-        mask_h = mask_h >> 1;
+        mask_h1 = mask_h1 >> 1;
+        mask_h2 = mask_h2 >>1 | 0x80;
         mask_l1 = mask_l1 >> 1;
         mask_l2 = mask_l2 << 1 | 0x01;
         mask_valid = mask_valid >> 1;
@@ -71,7 +88,8 @@ int8_t ccsi_packet_gen(char *in, size_t len_in, char *out, size_t len_out){
         //reset after 8
         if (shift > 7){
             shift = 0;
-            mask_h = 0xFF;
+            mask_h1 = 0xFF;
+            mask_h2 = 0x00;
             mask_l1 = 0xFF;
             mask_l2 = 0x00;
             mask_valid = 0x80;
@@ -80,11 +98,17 @@ int8_t ccsi_packet_gen(char *in, size_t len_in, char *out, size_t len_out){
     }
 
     //add stop bits >= 18 high, i.e. two full bytes plus initial mask.
-    out[j] |= 0xFF >> shift & mask_h;
+    out[j] |= 0xFF >> shift & mask_h1;
     out[j+1] = 0xFF;
     out[j+2] = 0xFF;
 
     return 0;
+}
+
+void print_buffer_formatting(uint8_t *buf, size_t len){
+    for(int i = 0; i < len; i++){
+        printf("%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X\n", i, BYTE_TO_BINARY(buf[i]), buf[i]); 
+    }
 }
 
 int main(int argc, char *argv[]){
@@ -96,34 +120,18 @@ int main(int argc, char *argv[]){
     uint8_t out[out_len];
     ccsi_packet_gen(data, sizeof(data), out, out_len);
 
-    for(int i = 0; i < sizeof(data); i++){
-        printf("%d = " BYTE_TO_BINARY_PATTERN "\n", i, BYTE_TO_BINARY(data[i])); 
- 
-    }
-
+    print_buffer_formatting(data, sizeof(data));
     printf("\n----new----\n");
-
-    for(int i = 0; i < sizeof(out); i++){
-        printf("%d = " BYTE_TO_BINARY_PATTERN "\n", i, BYTE_TO_BINARY(out[i])); 
- 
-    }
+    print_buffer_formatting(out, sizeof(out));
 
 
     size_t out_len2 = output_len_calc(sizeof(frame_sample_a_in));
     uint8_t out2[out_len2];
     ccsi_packet_gen(frame_sample_a_in, sizeof(frame_sample_a_in), out2, out_len2);
 
-    for(int i = 0; i < sizeof(frame_sample_a_in); i++){
-        printf("%d = " BYTE_TO_BINARY_PATTERN "\n", i, BYTE_TO_BINARY(frame_sample_a_in[i])); 
- 
-    }
-
+    print_buffer_formatting(frame_sample_a_in, sizeof(frame_sample_a_in));
     printf("\n----new----\n");
-
-    for(int i = 0; i < sizeof(out2); i++){
-        printf("%d = " BYTE_TO_BINARY_PATTERN " - 0x%02X\n", i, BYTE_TO_BINARY(out2[i]), out2[i]); 
- 
-    }
+    print_buffer_formatting(out2, sizeof(out2));
 
     return 0;
 }
