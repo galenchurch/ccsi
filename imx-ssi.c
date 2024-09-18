@@ -15,7 +15,17 @@
 // max Minor devices
 #define MAX_DEV 1
 
+#define MAX_WRITE_DATA  30
 
+struct imx_ssi_dev {
+    void __iomem *base;
+    struct clk *clk;
+};
+
+static struct imx_ssi_dev *g_ssi;
+
+//mutex for the ssi/ccsi port
+DEFINE_MUTEX(port_mutex);
 
 // device data holder, this structure may be extended to hold additional data
 struct mychar_device_data {
@@ -37,16 +47,19 @@ static int ccsidev_uevent(struct device *dev, struct kobj_uevent_env *env)
     return 0;
 }
 
-
-static int ccsidev_open(struct inode *inode, struct file *file)
-{
-    printk("ccsidev: Device open\n");
-    return 0;
+static int ccsidev_open(struct inode *inode, struct file *file) {
+    if (mutex_trylock(&port_mutex) == 1){
+        printk("ccsidev: CCSI Device opened\n");
+        return 0;
+    } else {
+        printk("ccsidev: FAILED to open ccsi. lock contention.\n");
+    }
+    return -1;
 }
 
-static int ccsidev_release(struct inode *inode, struct file *file)
-{
-    printk("ccsidev: Device close\n");
+static int ccsidev_release(struct inode *inode, struct file *file) {
+    mutex_unlock(&port_mutex);
+    printk("ccsidev: Device closed\n");
     return 0;
 }
 
@@ -62,27 +75,43 @@ static ssize_t ccsidev_read(struct file *file, char __user *buf, size_t count, l
     return 0;
 }
 
-static int ccsidev_write(struct file *file, const char __user *user_buffer, size_t size, loff_t * offset) {
-    size_t maxdatalen = 30, ncopied;
-    uint8_t databuf[maxdatalen];
+static int ccsidev_write(struct file *file, const char __user *u_buf, size_t size, loff_t *offset) {
+    uint8_t out[MAX_WRITE_DATA];
 
-    if (size < maxdatalen) {
-        maxdatalen = size;
+    if (g_ssi == NULL){
+        return -EFAULT;
     }
 
-    ncopied = copy_from_user(databuf, user_buffer, maxdatalen);
+    printk("ccsidev: Write got ssi resrouce @ %p \n",g_ssi->base);
 
-    if (ncopied == 0) {
-        printk("Copied %zd bytes from the user\n", maxdatalen);
-    } else {
-        printk("Could't copy %zd bytes from the user\n", ncopied);
+    if (size > MAX_WRITE_DATA) {
+        return -EFAULT;
     }
-
-    databuf[maxdatalen] = 0;
-
-    printk("Data from the user: %s\n", databuf);
-    //every 16bit word needs a check bit which is the not of bit 16 MSb
     
+
+    if (copy_from_user_nofault(out, u_buf, size) == 0) {
+        printk("ccsidev: Copied %zd bytes from the user\n", size);
+    } else {
+        printk("ccsidev: usercopy failed!\n");
+        return -EFAULT;
+    }
+
+    int i = 0;
+    while(i < size){
+        if (i+1 < size){
+            writel( (uint16_t)(out[i] << 8) | out[i+1], g_ssi->base + REG_SSI_STX0);
+        } else {
+            writel( (uint16_t)(out[i] << 8) | 0x00FF, g_ssi->base + REG_SSI_STX0); //no data is high so padd with 0xFF
+        }
+        i=i+2;
+    }
+
+    //leave 0xFFFF in the TX reg to hold the line high
+    writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
+
+    out[size] = 0;
+    printk("Data from the user: %s\n", out);
+    //every 16bit word needs a check bit which is the not of bit 16 MSb
 
     return size;
 }
@@ -101,19 +130,13 @@ static const struct file_operations ccsidev_fops = {
 //end char
 
 
-#define SSI_STX0 0x00
+// #define SSI_STX0 0x00
 // #define SSI_SCR  0x10
-#define SSI_STCR 0x1C
-#define SSI_STCCR 0x24
+// #define SSI_STCR 0x1C
+// #define SSI_STCCR 0x24
 
 #define SSI_SCR_CLK_IST	 0x00000200
-#define SSI_SCR_SYN			0x00000010
-
-
-struct imx_ssi_dev {
-    void __iomem *base;
-    struct clk *clk;
-};
+// #define SSI_SCR_SYN			0x00000010
 
 static int imx_ssi_probe(struct platform_device *pdev)
 {
@@ -140,7 +163,9 @@ static int imx_ssi_probe(struct platform_device *pdev)
     if (ret)
         return ret;
 
-    printk("got ssi resrouce @ %p \n",ssi->base);
+    //static for use in write.
+    g_ssi = ssi;
+    printk("got ssi resrouce @ %p \n",g_ssi->base);
 
     // Configure SSI
     reg = readl(ssi->base + REG_SSI_SCR);
@@ -148,8 +173,10 @@ static int imx_ssi_probe(struct platform_device *pdev)
     writel(0x0, ssi->base + REG_SSI_SCR);  // Disable SSI
     u32 send;
     send = SSI_SCR_SSIEN;
+    send |= SSI_SCR_TE;
     send |= SSI_SCR_TFR_CLK_DIS;
     send |= SSI_SCR_CLK_IST; //clock idle high
+    // send &= ~(SSI_SCR_CLK_IST); //clock idle low => this seems required for rising edge trigger
     send |= SSI_SCR_SYN;
     writel(send, ssi->base + REG_SSI_SCR);  // Enable SSI bit0 and TX bit 1
 
@@ -161,6 +188,8 @@ static int imx_ssi_probe(struct platform_device *pdev)
 
     u32 tcr = 0x0U;
     tcr |= SSI_STCR_TXBIT0; //LSB
+    tcr |= SSI_STCR_TSCKP;
+    // tcr &= ~(SSI_STCR_TSCKP); //data clocked on rising edge
     tcr |= SSI_STCR_TFDIR; //TFDIR fram sync is internal
     tcr |= SSI_STCR_TXDIR; //TXDIR to internal transmit clock
     tcr |= SSI_STCR_TFEN0; //fifo enable
@@ -170,7 +199,7 @@ static int imx_ssi_probe(struct platform_device *pdev)
 
     reg = readl(ssi->base + REG_SSI_STCCR);
     printk("read SSI_STCCR [tx_clock] = %x\n", reg);
-    reg = 80; //random devider for now
+    reg = 40; //random devider for now
     reg |= SSI_SxCCR_WL(16); //32bits wordlen (max)
     // reg |= SSI_SxCCR_DC(2);
     reg &= ~(SSI_SxCCR_DC_MASK); //disable frame sync
@@ -179,7 +208,14 @@ static int imx_ssi_probe(struct platform_device *pdev)
     writel(reg, ssi->base + REG_SSI_STCCR); //send something
 
     printk("writing 0xA1 after control = %x\n", reg);
-    writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
+    // writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
+    writel(send, ssi->base + REG_SSI_SCR);  // enable SSI
+
+
+    writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
+    // msleep(1);
+    udelay(100);
+    writel(0xFFFE, ssi->base + REG_SSI_STX0); //send something
 
 
     uint8_t cmd[] = {0xAA, 0x10}; //chip id
@@ -187,20 +223,40 @@ static int imx_ssi_probe(struct platform_device *pdev)
     size_t out_len = output_len_calc(sizeof(cmd));
     uint8_t out[out_len];
     ccsi_packet_gen(cmd, sizeof(cmd), out, out_len, 0);
-    printk("writing out %d bytes\n", out_len);
+    printk("writing chipid - %d bytes\n", out_len);
 
     int i = 0;
     while(i < out_len){
         if (i+1 < out_len){
-            writel((out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
+            writel( (uint16_t)(out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
         } else {
-            writel((out[i] << 8) & 0xFF00, ssi->base + REG_SSI_STX0);
+            writel( (uint16_t)(out[i] << 8) & 0xFFFF, ssi->base + REG_SSI_STX0);
+        }
+        i=i+2;
+    }
+    writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
+
+    // msleep(1);
+    udelay(100);
+
+    writel(0xFFFE, ssi->base + REG_SSI_STX0); //send something
+   
+   
+    cmd[1] = 0x70; // read chip id
+    ccsi_packet_gen(cmd, sizeof(cmd), out, out_len, 0);
+    printk("read chip id - %d bytes\n", out_len);
+ 
+    i = 0;
+    while(i < out_len){
+        if (i+1 < out_len){
+            writel( (uint16_t)(out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
+        } else {
+            writel( (uint16_t)(out[i] << 8) & 0xFFFF, ssi->base + REG_SSI_STX0);
         }
         i=i+2;
     }
 
-    // msleep(1);
-    writel(0x0, ssi->base + REG_SSI_STX0); //send something
+    writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
 
     // writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
     platform_set_drvdata(pdev, ssi);
@@ -235,10 +291,9 @@ static int imx_ssi_probe(struct platform_device *pdev)
 static int imx_ssi_remove(struct platform_device *pdev)
 {
     struct imx_ssi_dev *ssi = platform_get_drvdata(pdev);
+    int i;
     // writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
     clk_disable_unprepare(ssi->clk);
-
-    int i;
 
     for (i = 0; i < MAX_DEV; i++) {
         device_destroy(ccsidev_class, MKDEV(dev_major, i));
