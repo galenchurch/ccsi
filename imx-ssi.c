@@ -6,6 +6,8 @@
 #include <linux/delay.h>
 #include <fsl_ssi.h>
 
+#include <linux/gpio/consumer.h>
+
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
@@ -20,6 +22,7 @@
 //for some reason this isnt in fsl_ssi.h (everything else is)
 #define SSI_SCR_CLK_IST	 0x00000200
 
+struct gpio_desc *cs_line;
 
 struct imx_ssi_dev {
     void __iomem *base;
@@ -88,7 +91,7 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
         return -EFAULT;
     }
 
-    printk("ccsidev: Write got ssi resrouce @ %p \n",g_ssi->base);
+    // printk("ccsidev: Write got ssi resrouce @ %p \n",g_ssi->base);
     
     if (size > MAX_WRITE_DATA) {
         return -EFAULT;
@@ -96,7 +99,7 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     
 
     if (copy_from_user_nofault(frm_usr, u_buf, size) == 0) {
-        printk("ccsidev: Copied %zd bytes from the user\n", size);
+        // printk("ccsidev: Copied %zd bytes from the user\n", size);
     } else {
         printk("ccsidev: usercopy failed!\n");
         return -EFAULT;
@@ -108,8 +111,10 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     mutex_lock(&tx_lock);
     ///zero out the bus and transition from start
     writel(0xFFFF, g_ssi->base + REG_SSI_STX0); //pull high
-    udelay(10);
+    // udelay(10);
     writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
+    gpiod_set_value(cs_line, 0);
+
 
     int i = 0;
     while(i < out_len){
@@ -122,14 +127,16 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     }
 
     //leave 0xFFFF in the TX reg to hold the line high
-    udelay(100);
+    // udelay(10);
+    gpiod_set_value(cs_line, 1);
+
     writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
 
-    out[size] = 0;
-    printk("Writing %d bytes; Header from the user: 0x%02X 0x%02X\n", out_len, out[0], out[1]);
-    if(size > 2){
-        printk("First Data = 0x%02X\n", out[2]);
-    }
+    // out[size] = 0;
+    // printk("Writing %d bytes; Header from the user: 0x%02X 0x%02X\n", out_len, out[0], out[1]);
+    // if(size > 2){
+    //     printk("First Data = 0x%02X\n", out[2]);
+    // }
 
     mutex_unlock(&tx_lock);
     //every 16bit word needs a check bit which is the not of bit 16 MSb
@@ -170,6 +177,10 @@ static int imx_ssi_probe(struct platform_device *pdev)
     if (IS_ERR(ssi->clk))
         return PTR_ERR(ssi->clk);
 
+    cs_line = devm_gpiod_get(&pdev->dev, "cs", GPIOD_OUT_LOW);
+
+	gpiod_set_value(cs_line, 1);
+
     ret = clk_prepare_enable(ssi->clk);
     if (ret)
         return ret;
@@ -208,7 +219,7 @@ static int imx_ssi_probe(struct platform_device *pdev)
 
     reg = readl(ssi->base + REG_SSI_STCCR);
     printk("read SSI_STCCR [tx_clock] = %x\n", reg);
-    reg = 40; //random devider for now
+    reg = 5; //random devider for now
     reg |= SSI_SxCCR_WL(16); //32bits wordlen (max)
     // reg |= SSI_SxCCR_DC(2);
     reg &= ~(SSI_SxCCR_DC_MASK); //disable frame sync
@@ -226,13 +237,15 @@ static int imx_ssi_probe(struct platform_device *pdev)
     udelay(100);
     writel(0xFFFE, ssi->base + REG_SSI_STX0); 
 
-
     uint8_t cmd[] = {0xAA, 0x10}; //chip id
 
     size_t out_len = output_len_calc(sizeof(cmd));
     uint8_t out[out_len];
     ccsi_packet_gen(cmd, sizeof(cmd), out, out_len, 0);
     printk("writing chipid - %d bytes\n", out_len);
+
+    gpiod_set_value(cs_line, 0);
+
 
     int i = 0;
     while(i < out_len){
@@ -243,6 +256,8 @@ static int imx_ssi_probe(struct platform_device *pdev)
         }
         i=i+2;
     }
+
+
     writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
 
     // msleep(1);
@@ -264,6 +279,7 @@ static int imx_ssi_probe(struct platform_device *pdev)
         }
         i=i+2;
     }
+    gpiod_set_value(cs_line, 1);
 
     writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
 
