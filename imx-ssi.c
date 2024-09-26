@@ -110,7 +110,7 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     ccsi_packet_gen(frm_usr, size, out, out_len, 0);
     mutex_lock(&tx_lock);
     ///zero out the bus and transition from start
-    writel(0xFFFF, g_ssi->base + REG_SSI_STX0); //pull high
+    // writel(0xFFFF, g_ssi->base + REG_SSI_STX0); //pull high
     // udelay(10);
     writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
     gpiod_set_value(cs_line, 0);
