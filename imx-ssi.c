@@ -18,6 +18,7 @@
 #define MAX_DEV 1
 
 #define MAX_WRITE_DATA  30
+#define FULL_FRAME 256 * 3 *2
 
 //for some reason this isnt in fsl_ssi.h (everything else is)
 #define SSI_SCR_CLK_IST	 0x00000200
@@ -84,37 +85,15 @@ static ssize_t ccsidev_read(struct file *file, char __user *buf, size_t count, l
     return 0;
 }
 
-static int ccsidev_write(struct file *file, const char __user *u_buf, size_t size, loff_t *offset) {
-    uint8_t frm_usr[MAX_WRITE_DATA], out[MAX_WRITE_DATA];
+int send_packet(uint8_t *to_send, size_t size){
+    uint8_t out[MAX_WRITE_DATA];
     size_t out_len;
-    if (g_ssi == NULL){
-        return -EFAULT;
-    }
 
-    // printk("ccsidev: Write got ssi resrouce @ %p \n",g_ssi->base);
-    
-    if (size > MAX_WRITE_DATA) {
-        return -EFAULT;
-    }
-    
-
-    if (copy_from_user_nofault(frm_usr, u_buf, size) == 0) {
-        // printk("ccsidev: Copied %zd bytes from the user\n", size);
-    } else {
-        printk("ccsidev: usercopy failed!\n");
-        return -EFAULT;
-    }
-
-    out_len = output_len_calc(size);
-    // uint8_t out[out_len];
-    ccsi_packet_gen(frm_usr, size, out, out_len, 0);
-    mutex_lock(&tx_lock);
-    ///zero out the bus and transition from start
-    // writel(0xFFFF, g_ssi->base + REG_SSI_STX0); //pull high
-    // udelay(10);
-    writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
     gpiod_set_value(cs_line, 0);
 
+    out_len = output_len_calc(size);
+    ccsi_packet_gen(to_send, size, out, out_len, 0);
+    writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
 
     int i = 0;
     while(i < out_len){
@@ -126,17 +105,83 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
         i=i+2;
     }
 
-    //leave 0xFFFF in the TX reg to hold the line high
-    // udelay(10);
     gpiod_set_value(cs_line, 1);
 
     writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
 
-    // out[size] = 0;
-    // printk("Writing %d bytes; Header from the user: 0x%02X 0x%02X\n", out_len, out[0], out[1]);
-    // if(size > 2){
-    //     printk("First Data = 0x%02X\n", out[2]);
+    return 0;
+}
+
+static int ccsidev_write(struct file *file, const char __user *u_buf, size_t size, loff_t *offset) {
+    uint8_t frm_usr[FULL_FRAME], tmp_send[8];
+    size_t out_len;
+
+    int i = 0;
+    if (g_ssi == NULL){
+        return -EFAULT;
+    }
+    
+    if (size > FULL_FRAME) {
+        return -EFAULT;
+    }
+    
+    if (copy_from_user_nofault(frm_usr, u_buf, size) == 0) {
+        // printk("ccsidev: Copied %zd bytes from the user\n", size);
+    } else {
+        printk("ccsidev: usercopy failed!\n");
+        return -EFAULT;
+    }
+
+    mutex_lock(&tx_lock);
+
+    if (size <= 30){
+        send_packet(frm_usr, size);
+    } else {
+        // printk("CCSI sending frame of %ld\n", size);
+        //assume that its a while frame
+        //TODO: fix magic numbers
+        if(size == 256 * 3 *2){
+            //this is a frame with no header bytes..add them
+            tmp_send[0] = 0xAA;
+            tmp_send[1] = 0x30;
+
+            while (i + 6 <= size){
+                memcpy(&tmp_send[2], &frm_usr[i], 6);
+                send_packet(tmp_send, 8);
+                i=i+6;
+                udelay(20);
+            }
+            // printk("looped %d times size = %d\n", i, size);
+        } else {
+            printk("CCSI bad size, not sending = %ld\n", size);
+        }
+        
+    }
+    
+    
+
+    // out_len = output_len_calc(size);
+    // // uint8_t out[out_len];
+    // ccsi_packet_gen(frm_usr, size, out, out_len, 0);
+
+    // writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
+
+
+    // int i = 0;
+    // while(i < out_len){
+    //     if (i+1 < out_len){
+    //         writel( (uint16_t)(out[i] << 8) | out[i+1], g_ssi->base + REG_SSI_STX0);
+    //     } else {
+    //         writel( (uint16_t)(out[i] << 8) | 0x00FF, g_ssi->base + REG_SSI_STX0); //no data is high so padd with 0xFF
+    //     }
+    //     i=i+2;
     // }
+
+    // //leave 0xFFFF in the TX reg to hold the line high
+    // // udelay(10);
+    // gpiod_set_value(cs_line, 1);
+
+    // writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
 
     mutex_unlock(&tx_lock);
     //every 16bit word needs a check bit which is the not of bit 16 MSb
@@ -228,66 +273,12 @@ static int imx_ssi_probe(struct platform_device *pdev)
     writel(reg, ssi->base + REG_SSI_STCCR); 
 
     printk("writing 0xA1 after control = %x\n", reg);
-    // writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
     writel(send, ssi->base + REG_SSI_SCR);  // enable SSI
-
-
-    writel(0xFFFF, ssi->base + REG_SSI_STX0); 
-    // msleep(1);
-    udelay(100);
-    writel(0xFFFE, ssi->base + REG_SSI_STX0); 
-
-    uint8_t cmd[] = {0xAA, 0x10}; //chip id
-
-    size_t out_len = output_len_calc(sizeof(cmd));
-    uint8_t out[out_len];
-    ccsi_packet_gen(cmd, sizeof(cmd), out, out_len, 0);
-    printk("writing chipid - %d bytes\n", out_len);
-
-    gpiod_set_value(cs_line, 0);
-
-
-    int i = 0;
-    while(i < out_len){
-        if (i+1 < out_len){
-            writel( (uint16_t)(out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
-        } else {
-            writel( (uint16_t)(out[i] << 8) & 0xFFFF, ssi->base + REG_SSI_STX0);
-        }
-        i=i+2;
-    }
-
-
-    writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
-
-    // msleep(1);
-    udelay(100);
-
-    writel(0xFFFE, ssi->base + REG_SSI_STX0); //send something
    
-   
-    cmd[1] = 0x70; // read chip id
-    ccsi_packet_gen(cmd, sizeof(cmd), out, out_len, 0);
-    printk("read chip id - %d bytes\n", out_len);
- 
-    i = 0;
-    while(i < out_len){
-        if (i+1 < out_len){
-            writel( (uint16_t)(out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
-        } else {
-            writel( (uint16_t)(out[i] << 8) & 0xFFFF, ssi->base + REG_SSI_STX0);
-        }
-        i=i+2;
-    }
-    gpiod_set_value(cs_line, 1);
+    writel(0xFFFF, ssi->base + REG_SSI_STX0); //pull line up
 
-    writel(0xFFFF, ssi->base + REG_SSI_STX0); //send something
-
-    // writel(0x03, ssi->base + REG_SSI_SCR);  // enable SSI
     platform_set_drvdata(pdev, ssi);
-    printk("done\n");
-
-    //char dev
+    printk("CCSI Initialized\n");
 
     int err, idx;
     dev_t dev;
@@ -308,7 +299,7 @@ static int imx_ssi_probe(struct platform_device *pdev)
         device_create(ccsidev_class, NULL, MKDEV(dev_major, idx), NULL, "ccsidev-%d", idx);
     }
 
-    printk("char_done\n");
+    printk("CCSI Charachter driver created\n");
 
     return 0;
 }
