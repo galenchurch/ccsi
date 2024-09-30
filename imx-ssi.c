@@ -5,13 +5,14 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <fsl_ssi.h>
-
 #include <linux/gpio/consumer.h>
 
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
 #include "ccsi.h"
 
 // max Minor devices
@@ -19,37 +20,37 @@
 
 #define MAX_WRITE_DATA  30
 #define FULL_FRAME 256 * 3 *2
+#define SSI_BUFFER_SIZE (4 * 1024)  // 4KB buffer size
 
 //for some reason this isnt in fsl_ssi.h (everything else is)
 #define SSI_SCR_CLK_IST	 0x00000200
 
-struct gpio_desc *cs_line;
-
 struct imx_ssi_dev {
+    struct device *dev;
+    struct cdev cdev;
     void __iomem *base;
     struct clk *clk;
+    struct dma_chan *dma_chan;
+    char *buffer;
+    dma_addr_t buffer_dma;
+    struct dma_async_tx_descriptor *dma_desc;
+    struct completion dma_complete;
+    struct gpio_desc *cs_line;
 };
-
-static struct imx_ssi_dev *g_ssi;
 
 //mutex for the ssi/ccsi port
 DEFINE_MUTEX(port_mutex);
 
 DEFINE_MUTEX(tx_lock);
 
-// device data holder, this structure may be extended to hold additional data
-struct mychar_device_data {
-    struct cdev cdev;
-};
-
 // global storage for device Major number
 static int dev_major = 0;
 
-// sysfs class structure
+// // sysfs class structure
 static struct class *ccsidev_class = NULL;
 
-// array of mychar_device_data for
-static struct mychar_device_data ccsidev_data[MAX_DEV];
+// // array of mychar_device_data for
+// static struct mychar_device_data ccsidev_data[MAX_DEV];
 
 static int ccsidev_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
@@ -60,6 +61,8 @@ static int ccsidev_uevent(struct device *dev, struct kobj_uevent_env *env)
 static int ccsidev_open(struct inode *inode, struct file *file) {
     if (mutex_trylock(&port_mutex) == 1){
         printk("ccsidev: CCSI Device opened\n");
+        struct imx_ssi_dev *ssi = container_of(inode->i_cdev, struct imx_ssi_dev, cdev);
+        file->private_data = ssi; // Store the pointer in file's private data
         return 0;
     } else {
         printk("ccsidev: FAILED to open ccsi. lock contention.\n");
@@ -85,29 +88,29 @@ static ssize_t ccsidev_read(struct file *file, char __user *buf, size_t count, l
     return 0;
 }
 
-int send_packet(uint8_t *to_send, size_t size){
+int send_packet(struct imx_ssi_dev *ssi, uint8_t *to_send, size_t size){
     uint8_t out[MAX_WRITE_DATA];
     size_t out_len;
 
-    gpiod_set_value(cs_line, 0);
+    gpiod_set_value(ssi->cs_line, 0);
 
     out_len = output_len_calc(size);
     ccsi_packet_gen(to_send, size, out, out_len, 0);
-    writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
+    writel(0xFFFE, ssi->base + REG_SSI_STX0); //trasnition low one CC before data
 
     int i = 0;
     while(i < out_len){
         if (i+1 < out_len){
-            writel( (uint16_t)(out[i] << 8) | out[i+1], g_ssi->base + REG_SSI_STX0);
+            writel( (uint16_t)(out[i] << 8) | out[i+1], ssi->base + REG_SSI_STX0);
         } else {
-            writel( (uint16_t)(out[i] << 8) | 0x00FF, g_ssi->base + REG_SSI_STX0); //no data is high so padd with 0xFF
+            writel( (uint16_t)(out[i] << 8) | 0x00FF, ssi->base + REG_SSI_STX0); //no data is high so padd with 0xFF
         }
         i=i+2;
     }
 
-    gpiod_set_value(cs_line, 1);
+    gpiod_set_value(ssi->cs_line, 1);
 
-    writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
+    writel(0xFFFF, ssi->base + REG_SSI_STX0); 
 
     return 0;
 }
@@ -116,8 +119,10 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     uint8_t frm_usr[FULL_FRAME], tmp_send[8];
     size_t out_len;
 
+    struct imx_ssi_dev *ssi = file->private_data;
+
     int i = 0;
-    if (g_ssi == NULL){
+    if (ssi == NULL){
         return -EFAULT;
     }
     
@@ -135,7 +140,7 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
     mutex_lock(&tx_lock);
 
     if (size <= 30){
-        send_packet(frm_usr, size);
+        send_packet(ssi, frm_usr, size);
     } else {
         // printk("CCSI sending frame of %ld\n", size);
         //assume that its a while frame
@@ -147,7 +152,7 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
 
             while (i + 6 <= size){
                 memcpy(&tmp_send[2], &frm_usr[i], 6);
-                send_packet(tmp_send, 8);
+                send_packet(ssi, tmp_send, 8);
                 i=i+6;
                 udelay(20);
             }
@@ -175,43 +180,13 @@ static const struct file_operations ccsidev_fops = {
     .write       = ccsidev_write
 };
 
-
-static int imx_ssi_probe(struct platform_device *pdev)
-{
+static int config_ssi_as_ccsi(struct imx_ssi_dev *ssi){
     u32 reg;
-    printk("starting imx-ssi\n");
-    struct imx_ssi_dev *ssi;
-    struct resource *res;
-    int ret;
-
-    ssi = devm_kzalloc(&pdev->dev, sizeof(*ssi), GFP_KERNEL);
-    if (!ssi)
-        return -ENOMEM;
-
-    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-    ssi->base = devm_ioremap_resource(&pdev->dev, res);
-    if (IS_ERR(ssi->base))
-        return PTR_ERR(ssi->base);
-
-    ssi->clk = devm_clk_get(&pdev->dev, NULL);
-    if (IS_ERR(ssi->clk))
-        return PTR_ERR(ssi->clk);
-
-    cs_line = devm_gpiod_get(&pdev->dev, "cs", GPIOD_OUT_LOW);
-
-	gpiod_set_value(cs_line, 1);
-
-    ret = clk_prepare_enable(ssi->clk);
-    if (ret)
-        return ret;
-
-    //static for use in write.
-    g_ssi = ssi;
-    printk("got ssi resrouce @ %p \n",g_ssi->base);
-
     // Configure SSI
     // SSI Control Register
     // Read out value for debug
+    
+
     reg = readl(ssi->base + REG_SSI_SCR);
     printk("current control value = %x\n", reg);
 
@@ -258,8 +233,53 @@ static int imx_ssi_probe(struct platform_device *pdev)
    
     writel(0xFFFF, ssi->base + REG_SSI_STX0); //pull line up
 
-    platform_set_drvdata(pdev, ssi);
     printk("CCSI Initialized\n");
+
+    return 0;
+}
+
+static int imx_ssi_probe(struct platform_device *pdev)
+{
+    // u32 reg;
+    printk("starting imx-ssi\n");
+    struct imx_ssi_dev *ssi;
+    struct resource *res;
+    int ret;
+
+    ssi = devm_kzalloc(&pdev->dev, sizeof(*ssi), GFP_KERNEL);
+    if (!ssi)
+        return -ENOMEM;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    ssi->dev = &pdev->dev;
+
+    ssi->base = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(ssi->base))
+        return PTR_ERR(ssi->base);
+
+    //get clock from device tree
+    ssi->clk = devm_clk_get(&pdev->dev, NULL);
+    if (IS_ERR(ssi->clk))
+        return PTR_ERR(ssi->clk);
+
+    ret = clk_prepare_enable(ssi->clk);
+    if (ret)
+        return ret;
+
+    
+    //get debug CS line resource from device tree
+    ssi->cs_line = devm_gpiod_get(&pdev->dev, "cs", GPIOD_OUT_LOW);
+
+    //initialize high
+	gpiod_set_value(ssi->cs_line, 1);
+
+
+    //static for use in write.
+    // g_ssi = ssi;
+    printk("got ssi resrouce @ %p \n",ssi->base);
+
+    config_ssi_as_ccsi(ssi);
+
 
     int err, idx;
     dev_t dev;
@@ -271,14 +291,14 @@ static int imx_ssi_probe(struct platform_device *pdev)
     ccsidev_class = class_create(THIS_MODULE, "ccsidev");
     ccsidev_class->dev_uevent = ccsidev_uevent;
 
-    for (idx = 0; idx < MAX_DEV; idx++) {
-        cdev_init(&ccsidev_data[idx].cdev, &ccsidev_fops);
-        ccsidev_data[idx].cdev.owner = THIS_MODULE;
+    cdev_init(&ssi->cdev, &ccsidev_fops);
+    ssi->cdev.owner = THIS_MODULE;
 
-        cdev_add(&ccsidev_data[idx].cdev, MKDEV(dev_major, idx), 1);
+    cdev_add(&ssi->cdev, MKDEV(dev_major, idx), 1);
 
-        device_create(ccsidev_class, NULL, MKDEV(dev_major, idx), NULL, "ccsidev-%d", idx);
-    }
+    device_create(ccsidev_class, NULL, MKDEV(dev_major, idx), NULL, "ccsidev-%d", idx);
+    
+    platform_set_drvdata(pdev, ssi);
 
     printk("CCSI Charachter driver created\n");
 
@@ -300,6 +320,7 @@ static int imx_ssi_remove(struct platform_device *pdev)
     class_destroy(ccsidev_class);
 
     unregister_chrdev_region(MKDEV(dev_major, 0), MINORMASK);
+    cdev_del(&ssi->cdev);
 
 
     return 0;
