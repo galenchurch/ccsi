@@ -158,31 +158,6 @@ static int ccsidev_write(struct file *file, const char __user *u_buf, size_t siz
         
     }
     
-    
-
-    // out_len = output_len_calc(size);
-    // // uint8_t out[out_len];
-    // ccsi_packet_gen(frm_usr, size, out, out_len, 0);
-
-    // writel(0xFFFE, g_ssi->base + REG_SSI_STX0); //trasnition low one CC before data
-
-
-    // int i = 0;
-    // while(i < out_len){
-    //     if (i+1 < out_len){
-    //         writel( (uint16_t)(out[i] << 8) | out[i+1], g_ssi->base + REG_SSI_STX0);
-    //     } else {
-    //         writel( (uint16_t)(out[i] << 8) | 0x00FF, g_ssi->base + REG_SSI_STX0); //no data is high so padd with 0xFF
-    //     }
-    //     i=i+2;
-    // }
-
-    // //leave 0xFFFF in the TX reg to hold the line high
-    // // udelay(10);
-    // gpiod_set_value(cs_line, 1);
-
-    // writel(0xFFFF, g_ssi->base + REG_SSI_STX0); 
-
     mutex_unlock(&tx_lock);
     //every 16bit word needs a check bit which is the not of bit 16 MSb
 
@@ -235,25 +210,28 @@ static int imx_ssi_probe(struct platform_device *pdev)
     printk("got ssi resrouce @ %p \n",g_ssi->base);
 
     // Configure SSI
+    // SSI Control Register
+    // Read out value for debug
     reg = readl(ssi->base + REG_SSI_SCR);
     printk("current control value = %x\n", reg);
-    writel(0x0, ssi->base + REG_SSI_SCR);  // Disable SSI
-    u32 send;
-    send = SSI_SCR_SSIEN;
-    send |= SSI_SCR_TE;
-    send |= SSI_SCR_TFR_CLK_DIS;
-    send |= SSI_SCR_CLK_IST; //clock idle high
-    // send &= ~(SSI_SCR_CLK_IST); //clock idle low => this seems required for rising edge trigger
-    send |= SSI_SCR_SYN;
-    writel(send, ssi->base + REG_SSI_SCR);  // Enable SSI bit0 and TX bit 1
 
+    // Turn off the SSI initially
+    writel(0x0, ssi->base + REG_SSI_SCR);  // Disable SSI
+
+    //write values to register
+    u32 scr_reg = (u32)( SSI_SCR_SSIEN | SSI_SCR_TE | SSI_SCR_TFR_CLK_DIS | SSI_SCR_CLK_IST | SSI_SCR_SYN );
+    writel(scr_reg, ssi->base + REG_SSI_SCR);
+
+    //re-read for debug
     reg = readl(ssi->base + REG_SSI_SCR);
     printk("SSI_SCR control = %x\n", reg);
    
     reg = readl(ssi->base + REG_SSI_STCR);
     printk("read SSI_STCR = %x\n", reg);
 
-    u32 tcr = 0x0U;
+
+    // write the TCR
+    u32 tcr = 0U;
     tcr |= SSI_STCR_TXBIT0; //LSB
     tcr |= SSI_STCR_TSCKP;
     // tcr &= ~(SSI_STCR_TSCKP); //data clocked on rising edge
@@ -264,16 +242,19 @@ static int imx_ssi_probe(struct platform_device *pdev)
 
     reg = readl(ssi->base + REG_SSI_STCCR);
     printk("read SSI_STCCR [tx_clock] = %x\n", reg);
-    reg = 5; //random devider for now
-    reg |= SSI_SxCCR_WL(16); //32bits wordlen (max)
+
+    //config the TCCR
+    u32 tccr_reg = 0U;
+    tccr_reg = 5; //random devider for now
+    tccr_reg |= SSI_SxCCR_WL(16); //32bits wordlen (max)
     // reg |= SSI_SxCCR_DC(2);
-    reg &= ~(SSI_SxCCR_DC_MASK); //disable frame sync
+    tccr_reg &= ~(SSI_SxCCR_DC_MASK); //disable frame sync
     // reg |= (0x3 << 13); //wordlen 8bits??
     printk("writing SSI_STCCR [tx_clock] = %x\n", reg);
-    writel(reg, ssi->base + REG_SSI_STCCR); 
+    writel(tccr_reg, ssi->base + REG_SSI_STCCR); 
 
     printk("writing 0xA1 after control = %x\n", reg);
-    writel(send, ssi->base + REG_SSI_SCR);  // enable SSI
+    writel(scr_reg, ssi->base + REG_SSI_SCR);  // enable SSI
    
     writel(0xFFFF, ssi->base + REG_SSI_STX0); //pull line up
 
